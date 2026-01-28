@@ -1,0 +1,140 @@
+name: Deploy Express App
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - production
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check out success
+        run: |
+          echo "✅ Checked out code successfully"
+
+      - name: Set up SSH key
+        id: setup_ssh
+        run: |
+          set -e
+          echo "🔑 Setting up SSH key..."
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          echo "✅ SSH key set up"
+      
+      - name: Verify SSH key
+        run: |
+          set -e
+          echo "📋 Listing .ssh directory for debug:"
+          ls -l ~/.ssh/
+          echo "🔎 Showing SSH key fingerprint for debug:"
+          ssh-keygen -lf ~/.ssh/id_rsa
+
+      - name: Set Deploy Path
+        id: set_deploy_path
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          echo "🔁 Identifying Deployment Path for branch: $GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_NAME" = "production" ]; then
+            DEPLOY_PATH="/var/www/dev.borebell.in"
+            DEPLOY_NAME="dev.borebell.in"
+          elif [ "$GITHUB_REF_NAME" = "main" ]; then
+            DEPLOY_PATH="/var/www/borebell.in"
+            DEPLOY_NAME="borebell.in"
+          else
+            DEPLOY_PATH="/var/www/borebell.in"
+            DEPLOY_NAME="borebell.in"
+          fi
+          echo "DEPLOY_PATH=$DEPLOY_PATH" >> $GITHUB_ENV
+          echo "✅ Deployment path set: $DEPLOY_PATH"
+
+      - name: Check SSH Connection
+        env:
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USERNAME: ${{ secrets.SERVER_USER }}
+        run: |
+          set -e
+          echo "🔗 Checking SSH connection to $SSH_USERNAME@$SSH_HOST"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa "$SSH_USERNAME@$SSH_HOST" "echo '✅ SSH connection established'"
+
+      - name: Run Remote Deploy Script
+        env:
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USERNAME: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        run: |
+          set -e
+          echo "🚦 Starting remote deploy script on $DEPLOY_PATH"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa "$SSH_USERNAME@$SSH_HOST" "
+            set -e
+            echo '📂 Changing to deploy directory: '"$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+
+            echo 'Pulling code from origin $GITHUB_REF_NAME'
+            git checkout -f $GITHUB_REF_NAME || echo 'Git checkout failed, continuing with deployment'
+            git pull origin $GITHUB_REF_NAME --no-rebase || echo 'Git pull failed, continuing with deployment'
+            echo '✅ Code pulled successfully'
+            export NVM_DIR=/root/.nvm && source \$NVM_DIR/nvm.sh || echo 'NVM source failed, continuing with deployment'
+            echo '🔄 Checking for package.json changes and installing updated dependencies'
+            if git diff --name-only HEAD@{1} HEAD | grep -q '^package.json'; then
+              echo '🟢 Detected changes in package.json. Installing updated server dependencies...'
+              npm install --no-audit --no-fund || echo 'npm install failed, continuing'
+            else
+              echo '✅ No changes detected in server package.json'
+            fi
+            if git diff --name-only HEAD@{1} HEAD | grep -q '^client/package.json'; then
+              echo '🟢 Detected changes in client/package.json. Installing updated client dependencies...'
+              cd client
+              npm install --no-audit --no-fund || echo 'client npm install failed, continuing'
+              cd ..
+            else
+              echo '✅ No changes detected in client/package.json'
+            fi
+            pm2 list || echo 'pm2 list failed, continuing with deployment'
+            pm2 restart $DEPLOY_NAME || echo 'pm2 restart $DEPLOY_NAME failed, continuing with deployment'
+            if [ ! -f deploy.sh ]; then
+              echo '❌ deploy.sh does not exist in $DEPLOY_PATH'
+              echo 'Showing directory listing for debug:'
+              ls -l
+              exit 1
+            fi
+            echo '🔄 Check pm2 has service running for dev.borebell.in-subscribe'
+            if [ $(pm2 list | grep 'dev.borebell.in-subscribe' | wc -l) -eq 0 ]; then
+              echo '🟢 dev.borebell.in-subscribe service not running, starting it'
+              pm2 start node --name 'dev.borebell.in-subscribe' -- ./subscrib.service.js
+            else
+              pm2 restart dev.borebell.in-subscribe || echo 'pm2 restart dev.borebell.in-subscribe failed, continuing with deployment'
+              echo '✅ dev.borebell.in-subscribe service is running'
+            fi
+            echo '🗝️  Ensuring deploy.sh is executable'
+            chmod +x deploy.sh
+            echo '🚀 Executing deploy.sh'
+            mkdir -p logs
+            ./deploy.sh > ./logs/deployed.log 2>&1
+            echo '✅ Remote deploy.sh executed'
+          "
+          echo "🎉 Deployment completed successfully!"
+
+      - name: Show Deploy Log
+        if: always()
+        env:
+          SSH_HOST: ${{ secrets.SERVER_HOST }}
+          SSH_USERNAME: ${{ secrets.SERVER_USER }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        run: |
+          set -e
+          echo "📝 Fetching deployment log for debug:"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa "$SSH_USERNAME@$SSH_HOST" "tail -20 $DEPLOY_PATH/logs/deployed.log || echo 'No log found'"
